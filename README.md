@@ -7,3 +7,7 @@ The data includes as following:
 2. Bench Marks
 3. TaiWaN Tide model (The mean sea surface model was derived using satellite altimetry observation data from 1992 to 2019, the mean sea surface data from long-term tide stations, and the geoid model (TWHYGEO2014) published by the Ministry of the Interior. The interpolation was performed using the minimum curvature method with a spatial resolution of 30 seconds to obtain the mean sea surface model relative to the reference time of 2005.0. The mean sea surface model was then re-estimated relative to the reference time of 2012.0.)
 If you want to know the detailed, please refer to MOI website.(https://www.land.moi.gov.tw/upload/d5-202204151442005.pdf)
+
+
+![image](https://github.com/skyflying/Vertical_datum/blob/main/datum_relationship.png)
+The relationship between all vertical datum
