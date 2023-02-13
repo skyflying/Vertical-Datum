@@ -1,6 +1,6 @@
 # Vertical Datum Transformation in Taiwan
 
-In Taiwan, TWVD2001 and LAT are the official vertical datum. TWVD2001  is derived from the tidal information of Keelung Tide Station from 1957 to 1991 under the standard atmosphere environment of January 1, 1990. TWCD2021 has been announced in 2021. The tide observation records from 33 long-term tide gauges of the complete 19-year astronomical tide cycle from 2003 to 2021 were modeled  by reconciling the tide observation records from 1993 to 2020.
+In Taiwan, TWVD2001 and LAT are the official vertical datum. TWVD2001  is derived from the tidal information of Keelung Tide Station from 1957 to 1991 under the standard atmosphere environment of January 1, 1990. TWCD2021 has been announced in 2021. The tide observation records from 33 long-term tide gauges of the complete 19-year astronomical tide cycle from 2003 to 2021 were modeled  by reconciling the tide observation records from 1993 to 2020. Lat is a part of TWCD2021, and there are other vertical daum(HAT, MSL and others) and transformation interval(e.g. SEP model).
 
 The data includes as following:
 1. Tide gauge 
