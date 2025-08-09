@@ -1,492 +1,534 @@
+# -*- coding: big5 -*-
+"""
+Vertical Datum Transformation - PyQt5 version (accelerated)
+Requirements:
+  - Python 3.9+
+  - numpy, scipy, pillow, PyQt5
+Folder layout:
+  ./vertical_datum_qt.py
+  ./file/
+      MSS.xyz, HAT.xyz, MHW.xyz, MLW.xyz, LAT.xyz, ISLW.xyz, geoid.xyz
+      fig1.png
+"""
+
 import os
-
-from tkinter.constants import END
+import sys
 import numpy as np
-from scipy.interpolate import griddata
-# GUI development: using tkinter
-import tkinter as tk
-import tkinter.filedialog as fdialog
-import tkinter.messagebox as tkMessageBox
-import tkinter.ttk as ttk
-from PIL import Image, ImageTk
+
+from functools import lru_cache
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton, QFileDialog,
+    QGridLayout, QTabWidget, QRadioButton, QButtonGroup, QComboBox, QMessageBox
+)
+
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 
-# The title of graphical user interface (GUI)
-GUI_title = 'Vertical Datum Transformation'
-# size of window: '600x500'
-GUI_size = '600x500'
-# Names of two tabs
-Tab1 = 'Information'
-Tab2 = 'Transformation'
+# -----------------------------
+# Config & constants
+# -----------------------------
+GUI_TITLE = "Vertical Datum Transformation (PyQt5)"
+GUI_SIZE = (760, 640)
 
-# Information: Tab 1
-# subtitle
-Input_text = 'Input Surface'
-Output_text = 'Output Surface'
+Surface = [
+    "Mean Sea Surface (MSS)",
+    "Highest Astronomical Tide (HAT)",
+    "Mean High Water (MHW)",
+    "Mean Low Water (MLW)",
+    "Lowest Astronomical Tide (LAT)",
+    "Indian Spring Low Water (ISLW)",
+    "Geoid",
+    "Ellipsoid"
+]
+Surface_nickname = ["MSS", "HAT", "MHW", "MLW", "LAT", "ISLW", "Geoid", "EL"]
 
-# Different surfaces for transformation
-Surface = ['Mean Sea Surface (MSS)',
-           'Highest Astronomical Tide (HAT)',
-           'Mean High Water (MHW)',
-           'Mean Low Water (MLW)',	### 'Lowest Astronomical Tide (LAT)',
-           'Lowest Astronomical Tide (LAT)',	### 'Lowest Low Water (LLW)',
-           'Indian Spring Low Water (ISLW)',
-           'Geoid',
-           'Ellipsoid']	### 'Seabed Ellipsoidal Height (EL)']
-# brief name
-Surface_nickname = ['MSS', 'HAT', 'MHW', 'MLW',	### Surface_nickname = ['MSS', 'HAT', 'MHW', 'LAT',
-                    'LAT', 'ISIW', 'Geoid', 'EL']	### 'LLW', 'ISIW', 'Geoid', '    EL    ']
-#
-Surface_file = ['file/MSS.xyz',	### Surface_file = ['file/NCTU_mss_surface.xyz',
-                'file/HAT.xyz',
-                'file/MHW.xyz',
-                'file/MLW.xyz',	### 'file/LAT.xyz',
-                'file/LAT.xyz',	### 'file/LLW.xyz',
-                'file/ISLW.xyz',
-                'file/geoid.xyz']
-# Figure
-Fig1 = 'file/fig1.png'	### ISLW LAT switch positions
+Surface_file = [
+    "file/MSS.xyz",
+    "file/HAT.xyz",
+    "file/MHW.xyz",
+    "file/MLW.xyz",
+    "file/LAT.xyz",
+    "file/ISLW.xyz",
+    "file/geoid.xyz"
+]
+
+FIG_PATH = "file/fig1.png"
+
+# 有效範圍（台灣近海）：118–125E, 21–27N
+LON_MIN, LON_MAX = 118.0, 125.0
+LAT_MIN, LAT_MAX = 21.0, 27.0
 
 
-# Information: Tab 2
-# subtitle
-Single_text = 'Single point'
-File_text = 'Import a file'
-# buttons
-Single_trans_btn = 'Transform >'
-Import_file_btn = 'Browse'
-Output_dir_btn = 'Browse'
-File_trans_btn = 'Transform'
-Close_btn = 'Close'
-
-
-
-def Read_llv(filename):
-    lon = []
-    lat = []
-    value = []
-    with open(filename, 'r') as f:
-        data = f.readlines()
-    for i in range(len(data)):
-        info = data[i].split()
-        lon.append(float(info[0]))
-        lat.append(float(info[1]))
-        value.append(float(info[2]))
-    return(lon, lat, value)
-
-# Write result: lon/lat/value/new value
-
-
-def Write_llvn(filename, lon, lat, value1, value2):
-    with open(filename, 'w') as g:
-        for i in range(len(lon)):
-            # g.write(str(lon[i])+'\t'+str(lat[i])+'\t'+str(value1[i])+'\t'+str(value2[i])+'\n')
-            # g.write(str(lon[i])+'\t'+str(lat[i])+'\t')
-            g.write('%11.7f %10.7f %8.3f %8.3f\n' % (lon[i], lat[i], value1[i], value2[i]))	
-
-
-# for Impoting a file --> check if the point is within the range or not
-
-# Revised by Chong-You Wang, 2021-06-16.
-def check_range(lon, lat, value):
-    lon = np.array(lon)
-    lat = np.array(lat)
-    value = np.array(value)
-    index = np.where((lon <= 125) & (lon >= 118) & (lat <= 27) & (lat >= 21))	
-    lon_range = lon[index]
-    lat_range = lat[index]
-    value_range = value[index]
-    outrange_index = np.setdiff1d(range(len(lon)), index)
-    return(lon_range, lat_range, value_range, outrange_index)
-
-
-
-def Transform(input_index, output_index, input_lon, input_lat, input_depth):
-    print(Surface[input_index], '-> ', Surface[output_index])
-
-    lonlat_input = np.column_stack((input_lon, input_lat))
-    input_depth = np.array(input_depth)
-    del input_lon, input_lat
-
-    # Read the initial depth from input surface
-    if (input_index == 7) | ((output_index >=1) & (output_index <=5) & (input_index == 0)) :
-        initial_depth = np.zeros(input_depth.size)
-    else:
-        # Read initial surface
-        [loni, lati, value_ini] = Read_llv(Surface_file[input_index])
-        lonlat_ini = np.column_stack((loni, lati))
-        value_ini = np.array(value_ini)
-        del loni, lati
-        index_model = np.where(((lonlat_input[:, 0].max() + 0.5) >= lonlat_ini[:, 0]) & ((lonlat_input[:, 0].min() - 0.5) <= lonlat_ini[:, 0]) & ((lonlat_input[:, 1].max() + 0.5) >= lonlat_ini[:, 1]) & ((lonlat_input[:, 1].min() - 0.5) <= lonlat_ini[:, 1]))   # Optimized by Chong You. 2021.
-        lonlat_ini, value_ini = [lonlat_ini[index_model], value_ini[index_model]]
-        initial_depth=griddata(lonlat_ini, value_ini,lonlat_input, method='cubic') #input index 1~6
-        if (input_index >= 1) & (input_index <= 5) & (output_index >5) :
-            # Read MSS surface to transform reference to ell.
-            [lonp, latp, value_mss] = Read_llv(Surface_file[0])
-            lonlat_mss = np.column_stack((lonp, latp))
-            value_mss = np.array(value_mss)
-            del lonp, latp
-            lonlat_mss, value_mss = [ lonlat_mss[index_model], value_mss[index_model]]
-            mss=griddata(lonlat_mss, value_mss,lonlat_input, method='cubic')
-            initial_depth=initial_depth + mss
-
-    # Read the final depth from output surface
-    if (output_index == 7)  | ((input_index >=1) & (input_index <=5) & (output_index == 0)):
-        final_depth=np.zeros(input_depth.size)
-    else:
-        [lonO, latO, value_O] = Read_llv(Surface_file[output_index])
-        lonlat_O = np.column_stack((lonO, latO))
-        value_O = np.array(value_O)
-        del lonO, latO
-
-        index_model = np.where(((lonlat_input[:, 0].max() + 0.5) >= lonlat_O[:, 0]) & ((lonlat_input[:, 0].min() - 0.5) <= lonlat_O[:, 0]) & ((lonlat_input[:, 1].max() + 0.5) >= lonlat_O[:, 1]) & ((lonlat_input[:, 1].min() - 0.5) <= lonlat_O[:, 1]))   # Optimized by Chong You. 2021.
-        lonlat_O, value_O = [lonlat_O[index_model], value_O[index_model]]
-        final_depth=griddata(lonlat_O, value_O,lonlat_input, method='cubic')
-
-        if (output_index >= 1) & (output_index <= 5) & (input_index >5) :
-            # Read MSS surface to transform reference to ell.
-            [lonp, latp, value_mss] = Read_llv(Surface_file[0])
-            lonlat_mss = np.column_stack((lonp, latp))
-            value_mss = np.array(value_mss)
-            del lonp, latp
-            lonlat_mss, value_mss = [ lonlat_mss[index_model], value_mss[index_model]]
-            mss=griddata(lonlat_mss, value_mss,lonlat_input, method='cubic')
-            final_depth=final_depth + mss
-
-
-    # Calculation
-    #if input_index != 7 and output_index != 7:
-            # 各垂直基準面互轉
-    new_depth=input_depth + final_depth - initial_depth
-
-    #elif input_index == 7 and output_index != 7:
-            # 由海床橢球高算水深
-        #new_depth=final_depth - input_depth
-
-    #elif input_index != 7 and output_index == 7:
-            # 由水深算海床橢球高
-        #new_depth=initial_depth - input_depth
-    return(new_depth, initial_depth, final_depth)
-
-# Main execution
-# 0. Save selected information in tab 1
-# 1. Check the input information in tab 2
-# 2. Transformation --> call function "Transform"
-# 3. Display
-
-
-def Execute(case):
-    input_index=input_index_tmp.get()    # input surface
-    output_index=output_index_tmp.get()  # output surface
-    # print(Surface[input_index],'===>',Surface[output_index])
-
-    # Step 1. Check the range and format
-    check_condition=False
-    # <<<<< single point >>>>> save variables, check if it is in the range
-    if case == 0:
-        # this can just use when it is StringVar
-        if not input_lon_tmp.get() or not input_lat_tmp.get() or not input_depth_tmp.get():
-            tkMessageBox.showinfo('Error',
-                                  'Please fill in all the information:\nLongitude, Latitude and Depth.')
-        else:
+# -----------------------------
+# IO helpers
+# -----------------------------
+def read_llv(filename: str):
+    lon, lat, val = [], [], []
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip().split()
+            if len(s) < 3:
+                continue
             try:
-                float(input_lon_tmp.get()) and float(
-                    input_lon_tmp.get()) and float(input_depth_tmp.get())
+                lo = float(s[0]); la = float(s[1]); v = float(s[2])
+                lon.append(lo); lat.append(la); val.append(v)
             except ValueError:
-                tkMessageBox.showinfo('Error', 'Please type in float format.')
+                continue
+    return np.asarray(lon), np.asarray(lat), np.asarray(val)
+
+
+def write_llvn(filename: str, lon, lat, value1, value2):
+    with open(filename, "w", encoding="utf-8") as g:
+        for i in range(len(lon)):
+            lo = float(lon[i])
+            la = float(lat[i])
+            v1 = value1[i]
+            v2 = value2[i]
+            # 對於 NaN，輸出空白
+            s_v1 = f"{v1:8.3f}" if np.isfinite(v1) else "      NaN"
+            s_v2 = f"{v2:8.3f}" if np.isfinite(v2) else "      NaN"
+            g.write(f"{lo:11.7f} {la:10.7f} {s_v1} {s_v2}\n")
+
+
+def check_range(lon, lat, value):
+    lon = np.asarray(lon); lat = np.asarray(lat); value = np.asarray(value)
+    mask = (lon >= LON_MIN) & (lon <= LON_MAX) & (lat >= LAT_MIN) & (lat <= LAT_MAX)
+    idx_in = np.where(mask)[0]
+    idx_out = np.where(~mask)[0]
+    return lon[idx_in], lat[idx_in], value[idx_in], idx_out
+
+
+# -----------------------------
+# Accelerated interpolators with cache
+# -----------------------------
+@lru_cache(maxsize=None)
+def load_surface_points(surface_idx: int):
+    """Load raw xyz once and cache."""
+    # Ellipsoid: return empty arrays; handled as zeros later
+    if surface_idx == 7:
+        return np.empty((0, 2)), np.empty((0,))
+    path = Surface_file[surface_idx]
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing surface file: {path}")
+    lon, lat, val = read_llv(path)
+    P = np.column_stack([lon, lat]).astype(np.float64)
+    V = val.astype(np.float64)
+    return P, V
+
+
+_interpolators_linear = {}
+_interpolators_nearest = {}
+
+
+def get_linear_interp(surface_idx: int):
+    if surface_idx == 7:
+        return None
+    if surface_idx not in _interpolators_linear:
+        P, V = load_surface_points(surface_idx)
+        _interpolators_linear[surface_idx] = LinearNDInterpolator(P, V)
+    return _interpolators_linear[surface_idx]
+
+
+def get_nearest_interp(surface_idx: int):
+    if surface_idx == 7:
+        return None
+    if surface_idx not in _interpolators_nearest:
+        P, V = load_surface_points(surface_idx)
+        _interpolators_nearest[surface_idx] = NearestNDInterpolator(P, V)
+    return _interpolators_nearest[surface_idx]
+
+
+def interp_surface_with_fallback(surface_idx: int, XY: np.ndarray) -> np.ndarray:
+    """
+    回傳該 surface 相對橢球的高程 H_surface(λ,φ)（向上為正）
+    Ellipsoid(7) 視為 0。
+    策略：linear 為主，NaN 再用 nearest 回補。
+    """
+    if surface_idx == 7:
+        return np.zeros(XY.shape[0], dtype=np.float64)
+
+    lin = get_linear_interp(surface_idx)
+    z = lin(XY[:, 0], XY[:, 1])
+
+    if np.isscalar(z):
+        # 單點輸入情形，包成 array
+        z = np.asarray([z], dtype=np.float64)
+
+    if np.isnan(z).any():
+        nn = get_nearest_interp(surface_idx)
+        z_nn = nn(XY[:, 0], XY[:, 1])
+        z = np.where(np.isnan(z), z_nn, z)
+
+    return z.astype(np.float64)
+
+
+# -----------------------------
+# Core transform
+# -----------------------------
+def transform_values(input_surface_idx: int,
+                     output_surface_idx: int,
+                     lon: np.ndarray,
+                     lat: np.ndarray,
+                     values: np.ndarray,
+                     input_value_type: str):
+    """
+    input_value_type: 'DEPTH' (向下為正) or 'ELLI_BED' (海床橢球高，向上為正)
+    回傳：
+      new_vals, H_in, H_out  （皆為 numpy array）
+    假設：所有 Surface_file 之 value 為「對橢球高程」。
+    """
+    XY = np.column_stack([lon.astype(np.float64), lat.astype(np.float64)])
+    H_in = interp_surface_with_fallback(input_surface_idx, XY)
+    H_out = interp_surface_with_fallback(output_surface_idx, XY)
+
+    if input_value_type == "DEPTH":
+        # 已知深度（向下為正）。純位移換算。
+        new_vals = values + (H_out - H_in)
+    elif input_value_type == "ELLI_BED":
+        # 已知海床橢球高（向上為正），輸出想要「相對 output_surface 的深度」
+        # d_out = H_out - h_bed
+        new_vals = H_out - values
+    else:
+        raise ValueError("Unknown input_value_type")
+
+    return new_vals, H_in, H_out
+
+
+# -----------------------------
+# Worker thread for file transform
+# -----------------------------
+class FileTransformWorker(QThread):
+    finished = pyqtSignal(bool, str)  # success, message
+
+    def __init__(self, input_surface_idx, output_surface_idx,
+                 input_path, output_dir, output_name, input_value_type):
+        super().__init__()
+        self.input_surface_idx = input_surface_idx
+        self.output_surface_idx = output_surface_idx
+        self.input_path = input_path
+        self.output_dir = output_dir
+        self.output_name = output_name
+        self.input_value_type = input_value_type
+
+    def run(self):
+        try:
+            lon0, lat0, val0 = read_llv(self.input_path)
+            if lon0.size == 0:
+                self.finished.emit(False, "Input file is empty or invalid.")
+                return
+
+            lon_in, lat_in, val_in, idx_out = check_range(lon0, lat0, val0)
+
+            if lon_in.size > 0:
+                new_in, _, _ = transform_values(
+                    self.input_surface_idx, self.output_surface_idx,
+                    lon_in, lat_in, val_in, self.input_value_type
+                )
+                # 回填成與原始同長度
+                new_full = np.full(lon0.shape[0], np.nan, dtype=np.float64)
+                mask = np.ones(lon0.shape[0], dtype=bool)
+                if idx_out.size > 0:
+                    mask[idx_out] = False
+                new_full[mask] = new_in
             else:
-                # get the variables from entries
-                input_lon=float(input_lon_tmp.get())
-                input_lat=float(input_lat_tmp.get())
-                input_depth=float(input_depth_tmp.get())
-                # check if it's out of the range
-                if input_lon > 125 or input_lon < 118 or input_lat > 27 or input_lat < 21:
-                    tkMessageBox.showinfo('Error',
-                                          'The point must be inside the range:\n 118~125E, 21~27N.')
-                else:
-                    check_condition=True
-    # <<<<< file import >>>>> save variables, read file, check if they are in the range
-    elif case == 1:
-        # Save variables
-        if not (input_path_tmp.get()):
-            tkMessageBox.showinfo('Error', 'Please select the input file')
-        elif not (output_dir_tmp.get()):
-            tkMessageBox.showinfo(
-                'Error', 'Please choose a directory for output file')
-        elif not (output_name_tmp.get()):
-            tkMessageBox.showinfo('Error', 'Please name the output file')
-        else:
-            # get the variables from entries
-            input_path=input_path_tmp.get()
-            output_dir=output_dir_tmp.get()
-            output_name=output_name_tmp.get()
-            # Read the file
-            [input_lon0, input_lat0, input_depth0]=Read_llv(input_path)
-            # check if all the points are within the range
-            [input_lon, input_lat, input_depth, outrange_i]=check_range(
-                input_lon0, input_lat0, input_depth0)
+                # 全部越界
+                new_full = np.full(lon0.shape[0], np.nan, dtype=np.float64)
 
-            if len(outrange_i) == 1:
-                tkMessageBox.showinfo('Warning',
-                                      'There is '+str(len(outrange_i))+' point outside the range:\n 118~125E, 21~27N.')
-            elif len(outrange_i) > 1:
-                tkMessageBox.showinfo('Warning',
-                                      'There are '+str(len(outrange_i))+' points outside the range:\n 118~125E, 21~27N.')
-            check_condition=True
+            os.makedirs(self.output_dir, exist_ok=True)
+            out_path = os.path.join(self.output_dir, self.output_name)
+            write_llvn(out_path, lon0, lat0, val0, new_full)
 
-    # Step 2. Transform
-    while check_condition:  # Execute step 2 after step 1
-        [new_depth, initial_depth, final_depth]=Transform(
-            input_index, output_index, input_lon, input_lat, input_depth)
-
-        # Step 3. Display
-        # '({:^10})'.format('Hello')
-        if case == 0:
-            label=tk.Label(page2, text='({:^7})'.format(
-                Surface_nickname[input_index]))
-            label.grid(row=12, column=6, columnspan=1, sticky='W')
-            label=tk.Label(page2, text='New value')
-            label.grid(row=13, column=3)
-            label=tk.Label(
-                page2, text='({:^7})'.format(Surface_nickname[output_index]))
-            label.grid(row=14, column=6, columnspan=1, sticky='W')
-            label=tk.Label(page2, text='%.4f' % new_depth)
-            label.grid(row=14, column=3)
-
-        elif case == 1:
-            PWD=os.getcwd()
-            os.chdir(output_dir)
-            if len(outrange_i) > 0:
-                for i in range(len(outrange_i)):
-                    new_depth=np.insert(new_depth, outrange_i[i], np.nan)
-
-                Write_llvn(output_name, input_lon0,
-                           input_lat0, input_depth0, new_depth)
-            else:
-                Write_llvn(output_name, input_lon,
-                           input_lat, input_depth, new_depth)
-            os.chdir(PWD)
-            label=tk.Label(page2, text=' OK! ')
-            label.grid(row=24, column=7)
-        check_condition=False
+            msg = "OK!"
+            if idx_out.size == 1:
+                msg += "  (There is 1 point outside the range)"
+            elif idx_out.size > 1:
+                msg += f"  (There are {idx_out.size} points outside the range)"
+            self.finished.emit(True, msg)
+        except Exception as e:
+            self.finished.emit(False, f"Error: {e}")
 
 
-####################################################
-############### Create GUI Interface ###############
-####################################################
-main=tk.Tk()
-main.title(GUI_title)
-main.geometry(GUI_size)
+# -----------------------------
+# Main window (PyQt5)
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(GUI_TITLE)
+        self.resize(*GUI_SIZE)
 
-# gives weight to the cells in the grid
-rows=0
-while rows < 50:
-    main.rowconfigure(rows, weight=1)
-    main.columnconfigure(rows, weight=1)
-    rows += 1
+        # State
+        self.input_surface_idx = 0
+        self.output_surface_idx = 1
 
-# Defines and places the notebook widget
-nb=ttk.Notebook(main)
-nb.grid(row=1, column=0, columnspan=50, rowspan=49, sticky='NESW')
+        # Widgets
+        tabs = QTabWidget()
+        self.setCentralWidget(tabs)
 
-####################################################
-###################### Tab 1. ######################
-####################################################
-# Adds tab 1 of the notebook
-page1=ttk.Frame(nb)
-nb.add(page1, text=Tab1)
+        # Tab 1: Information
+        self.tab_info = QWidget()
+        self.build_tab_info(self.tab_info)
+        tabs.addTab(self.tab_info, "Information")
 
-# labels for input and output titles
-label=tk.Label(page1, text=Input_text,
-                 font="Helvetica 12 bold")
-label.grid(row=0, column=0, sticky='nw')
+        # Tab 2: Transformation
+        self.tab_trans = QWidget()
+        self.build_tab_trans(self.tab_trans)
+        tabs.addTab(self.tab_trans, "Transformation")
 
-label=tk.Label(page1, text=Output_text,
-                 font="Helvetica 12 bold")
-label.grid(row=0, column=2, sticky='nw')
+    # ---- Tab 1 ----
+    def build_tab_info(self, parent: QWidget):
+        layout = QGridLayout(parent)
 
-# Suface selection
-# set the variables for input/output index (tmp)
-input_index_tmp=tk.IntVar()
-output_index_tmp=tk.IntVar()
-# set the initial selection of the two buttons
-input_index_tmp.set(0)
-output_index_tmp.set(1)
+        # 左右兩欄：輸入基準 / 輸出基準
+        lbl_in = QLabel("Input Surface")
+        lbl_in.setStyleSheet("font-weight:600;")
+        layout.addWidget(lbl_in, 0, 0, Qt.AlignLeft)
 
-# check the two buttons for not making the same selection
+        lbl_out = QLabel("Output Surface")
+        lbl_out.setStyleSheet("font-weight:600;")
+        layout.addWidget(lbl_out, 0, 2, Qt.AlignLeft)
+
+        # Radio groups
+        self.grp_in = QButtonGroup(self)
+        self.grp_out = QButtonGroup(self)
+
+        for i, name in enumerate(Surface):
+            rb_in = QRadioButton(name)
+            rb_out = QRadioButton(name)
+            if i == 0:
+                rb_in.setChecked(True)
+            if i == 1:
+                rb_out.setChecked(True)
+            self.grp_in.addButton(rb_in, i)
+            self.grp_out.addButton(rb_out, i)
+            layout.addWidget(rb_in, i + 1, 0, Qt.AlignLeft)
+            layout.addWidget(rb_out, i + 1, 2, Qt.AlignLeft)
+
+        self.grp_in.buttonClicked[int].connect(self.on_input_surface_changed)
+        self.grp_out.buttonClicked[int].connect(self.on_output_surface_changed)
+
+        # Image
+        fig_label = QLabel()
+        if os.path.exists(FIG_PATH):
+            pix = QPixmap(FIG_PATH)
+            if not pix.isNull():
+                # 等比例縮放寬 520
+                w = 520
+                h = int(pix.height() * (w / pix.width()))
+                fig_label.setPixmap(pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(fig_label, 20, 0, 1, 3, Qt.AlignLeft)
+
+    def on_input_surface_changed(self, idx: int):
+        self.input_surface_idx = idx
+        # 不允許同一面：若相同就把 output 往下一格
+        if self.input_surface_idx == self.output_surface_idx:
+            new_out = (self.output_surface_idx + 1) % len(Surface)
+            self.grp_out.button(new_out).setChecked(True)
+            self.output_surface_idx = new_out
+
+    def on_output_surface_changed(self, idx: int):
+        self.output_surface_idx = idx
+        if self.input_surface_idx == self.output_surface_idx:
+            new_in = (self.input_surface_idx + 1) % len(Surface)
+            self.grp_in.button(new_in).setChecked(True)
+            self.input_surface_idx = new_in
+
+    # ---- Tab 2 ----
+    def build_tab_trans(self, parent: QWidget):
+        layout = QGridLayout(parent)
+
+        # Range box (文字)
+        lbl_range_title = QLabel("Range")
+        lbl_range_title.setStyleSheet("font-weight:600;")
+        layout.addWidget(lbl_range_title, 0, 0, Qt.AlignLeft)
+
+        lbl_range = QLabel(
+            "     ---------  27 N ---------\n"
+            "    |                           |\n"
+            "    118 E                    125 E\n"
+            "    |                           |\n"
+            "     ---------  21 N ---------\n"
+        )
+        layout.addWidget(lbl_range, 1, 0, 1, 4, Qt.AlignLeft)
+
+        # ---- Single point ----
+        lbl_single = QLabel("Single point")
+        lbl_single.setStyleSheet("font-weight:600;")
+        layout.addWidget(lbl_single, 3, 0, Qt.AlignLeft)
+
+        layout.addWidget(QLabel("Longitude"), 4, 0)
+        layout.addWidget(QLabel("Latitude"), 4, 1)
+        layout.addWidget(QLabel("Input value"), 4, 2)
+
+        self.ed_lon = QLineEdit(); self.ed_lon.setPlaceholderText("e.g. 121.5")
+        self.ed_lat = QLineEdit(); self.ed_lat.setPlaceholderText("e.g. 24.0")
+        self.ed_val = QLineEdit(); self.ed_val.setPlaceholderText("float")
+
+        layout.addWidget(self.ed_lon, 5, 0)
+        layout.addWidget(self.ed_lat, 5, 1)
+        layout.addWidget(self.ed_val, 5, 2)
+
+        # Input value type
+        layout.addWidget(QLabel("Input value type"), 4, 3)
+        self.cmb_valtype = QComboBox()
+        self.cmb_valtype.addItems(["Depth (down +)", "Ellipsoidal bed height (up +)"])
+        layout.addWidget(self.cmb_valtype, 5, 3)
+
+        # Output labels
+        self.lbl_single_out_title = QLabel("New value")
+        layout.addWidget(self.lbl_single_out_title, 6, 2)
+        self.lbl_single_in_nick = QLabel("(      )")
+        self.lbl_single_out_nick = QLabel("(      )")
+        layout.addWidget(self.lbl_single_in_nick, 5, 4)
+        layout.addWidget(self.lbl_single_out_nick, 7, 4)
+
+        self.lbl_single_out_val = QLabel("—")
+        layout.addWidget(self.lbl_single_out_val, 7, 2)
+
+        btn_single = QPushButton("Transform >")
+        btn_single.clicked.connect(self.do_single_transform)
+        layout.addWidget(btn_single, 6, 3)
+
+        # ---- File transform ----
+        lbl_file = QLabel("Import a file")
+        lbl_file.setStyleSheet("font-weight:600;")
+        layout.addWidget(lbl_file, 10, 0, Qt.AlignLeft)
+
+        layout.addWidget(QLabel("Input file"), 12, 0)
+        layout.addWidget(QLabel("Output directory"), 13, 0)
+        layout.addWidget(QLabel("Output file"), 14, 1, Qt.AlignRight)
+
+        self.ed_infile = QLineEdit()
+        self.ed_outdir = QLineEdit()
+        self.ed_outname = QLineEdit()
+        self.ed_outname.setPlaceholderText("output.xyz")
+
+        layout.addWidget(self.ed_infile, 12, 1, 1, 3)
+        layout.addWidget(self.ed_outdir, 13, 1, 1, 3)
+        layout.addWidget(self.ed_outname, 14, 2, 1, 2)
+
+        btn_browse_in = QPushButton("Browse")
+        btn_browse_out = QPushButton("Browse")
+        btn_browse_in.clicked.connect(self.pick_infile)
+        btn_browse_out.clicked.connect(self.pick_outdir)
+        layout.addWidget(btn_browse_in, 12, 4)
+        layout.addWidget(btn_browse_out, 13, 4)
+
+        self.btn_file_transform = QPushButton("Transform")
+        self.btn_file_transform.clicked.connect(self.do_file_transform)
+        layout.addWidget(self.btn_file_transform, 14, 4)
+
+        self.lbl_file_status = QLabel("")
+        layout.addWidget(self.lbl_file_status, 15, 4)
+
+        # Notes
+        note1 = "註1 : 水深值(垂直基準面至海床垂直距離)坐標軸向下為正"
+        note2 = "註2 : 海床橢球高(橢球面至海床垂直距離)坐標軸向上為正"
+        note3 = "註3 : Ellipsoid在海域上指的是海床橢球高，在陸域則是代表該點的橢球高"
+        note4 = "註4 : 內陸橢球高進行正高轉換時，輸出值為負代表該點在geoid之上，"
+        note5 = "         例如: 輸出值為-5公尺代表該點正高為5公尺"
+
+        layout.addWidget(QLabel(note1), 20, 0, 1, 5)
+        layout.addWidget(QLabel(note2), 21, 0, 1, 5)
+        layout.addWidget(QLabel(note3), 22, 0, 1, 5)
+        layout.addWidget(QLabel(note4), 23, 0, 1, 5)
+        layout.addWidget(QLabel(note5), 24, 0, 1, 5)
+
+        self.update_nick_labels()
+
+    def update_nick_labels(self):
+        self.lbl_single_in_nick.setText(f"({Surface_nickname[self.input_surface_idx]:^7})")
+        self.lbl_single_out_nick.setText(f"({Surface_nickname[self.output_surface_idx]:^7})")
+
+    # --- Single transform ---
+    def do_single_transform(self):
+        # inputs check
+        lon_txt = self.ed_lon.text().strip()
+        lat_txt = self.ed_lat.text().strip()
+        val_txt = self.ed_val.text().strip()
+        if not lon_txt or not lat_txt or not val_txt:
+            QMessageBox.information(self, "Error", "Please fill in Longitude, Latitude, and Input value.")
+            return
+        try:
+            lon = float(lon_txt); lat = float(lat_txt); val = float(val_txt)
+        except ValueError:
+            QMessageBox.information(self, "Error", "Please type in float format.")
+            return
+
+        if not (LON_MIN <= lon <= LON_MAX and LAT_MIN <= lat <= LAT_MAX):
+            QMessageBox.information(
+                self, "Error",
+                f"The point must be inside the range:\n {LON_MIN}~{LON_MAX}E, {LAT_MIN}~{LAT_MAX}N."
+            )
+            return
+
+        input_type = "DEPTH" if self.cmb_valtype.currentIndex() == 0 else "ELLI_BED"
+
+        # compute
+        new_vals, _, _ = transform_values(
+            self.input_surface_idx, self.output_surface_idx,
+            np.array([lon]), np.array([lat]), np.array([val]), input_type
+        )
+        self.lbl_single_out_val.setText(f"{new_vals[0]:.4f}")
+        self.update_nick_labels()
+
+    # --- File transform ---
+    def pick_infile(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select a file", os.getcwd(), "XYZ files (*.xyz);;All files (*.*)")
+        if path:
+            self.ed_infile.setText(path)
+
+    def pick_outdir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select a directory", os.getcwd())
+        if path:
+            self.ed_outdir.setText(path)
+
+    def do_file_transform(self):
+        in_path = self.ed_infile.text().strip()
+        out_dir = self.ed_outdir.text().strip()
+        out_name = self.ed_outname.text().strip()
+
+        if not in_path:
+            QMessageBox.information(self, "Error", "Please select the input file")
+            return
+        if not out_dir:
+            QMessageBox.information(self, "Error", "Please choose a directory for output file")
+            return
+        if not out_name:
+            QMessageBox.information(self, "Error", "Please name the output file")
+            return
+
+        input_type = "DEPTH" if self.cmb_valtype.currentIndex() == 0 else "ELLI_BED"
+
+        self.btn_file_transform.setEnabled(False)
+        self.lbl_file_status.setText("Running...")
+
+        self.worker = FileTransformWorker(
+            self.input_surface_idx, self.output_surface_idx,
+            in_path, out_dir, out_name, input_type
+        )
+        self.worker.finished.connect(self.on_file_finished)
+        self.worker.start()
+
+    def on_file_finished(self, success: bool, message: str):
+        self.btn_file_transform.setEnabled(True)
+        self.lbl_file_status.setText(message)
+        if not success:
+            QMessageBox.warning(self, "Transform error", message)
 
 
-def CHECK1(IN, OUT):
-    if IN == OUT:
-        output_index_tmp.set((OUT+1) % len(Surface))
+# -----------------------------
+# Entry
+# -----------------------------
+def main():
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
 
 
-def CHECK2(IN, OUT):
-    if IN == OUT:
-        input_index_tmp.set((IN+1) % len(Surface))
-
-
-# create radio buttons
-for i in range(len(Surface)):
-    rb1=tk.Radiobutton(page1, text=Surface[i], variable=input_index_tmp, value=i,
-                         command=lambda *args: CHECK1(input_index_tmp.get(), output_index_tmp.get()))
-    rb1.grid(row=i+1, column=0, sticky='nw')
-    rb2=tk.Radiobutton(page1, text=Surface[i], variable=output_index_tmp, value=i,
-                         command=lambda *args: CHECK2(input_index_tmp.get(), output_index_tmp.get()))
-    rb2.grid(row=i+1, column=2, sticky='nw')
-
-# Figure
-pil_image=Image.open(Fig1)
-
-width=450
-ratio=float(width)/pil_image.size[0]
-height=int(pil_image.size[1]*ratio)
-
-pil_image_resized=pil_image.resize((width, height), Image.BILINEAR)
-tk_image=ImageTk.PhotoImage(pil_image_resized)
-label=tk.Label(page1, image=tk_image)
-label.grid(row=20, column=0, columnspan=3)
-
-####################################################
-###################### Tab 2. ######################
-####################################################
-page2=ttk.Frame(nb)
-nb.add(page2, text=Tab2)
-
-
-# Refinements
-label=tk.Label(page2, text='Range', font="Helvetica 12 bold")
-label.config(fg='#000000')
-label.grid(row=5, column=0, sticky='nw')
-label=tk.Label(page2, text='''     ---------  27 N ---------
-    |                                        |
-    118 E                                  125 E
-    |                                        |
-    ---------  21 N ---------
-                   ''')
-label.grid(row=6, column=0, columnspan=5, rowspan=2, sticky='nw')
-
-# <<<<< Single point >>>>>
-# labels for subtitle
-label=tk.Label(page2, text=Single_text,
-                 font="Helvetica 12 bold")
-label.grid(row=10, column=0, sticky='nw')
-
-# labels for single point
-label=tk.Label(page2, text='Longitude')
-label.grid(row=11, column=1)
-label=tk.Label(page2, text='Latitude')
-label.grid(row=11, column=2)
-
-label=tk.Label(page2, text='Input value')
-label.grid(row=11, column=3)
-
-# textboxes for single lon/lat/depths
-input_lon_tmp=tk.StringVar()
-input_lat_tmp=tk.StringVar()
-input_depth_tmp=tk.StringVar()
-edTxt1=tk.Entry(page2, textvariable=input_lon_tmp,
-                  width=13, justify='center', borderwidth=2)
-edTxt1.grid(row=12, column=1)
-edTxt2=tk.Entry(page2, textvariable=input_lat_tmp,
-                  width=13, justify='center', borderwidth=2)
-edTxt2.grid(row=12, column=2)
-edTxt3=tk.Entry(page2, textvariable=input_depth_tmp,
-                  width=13, justify='center', borderwidth=2)
-edTxt3.grid(row=12, column=3)
-
-# <<<<< Import a file >>>>>
-label=tk.Label(page2, text=File_text, font="Helvetica 12 bold")
-label.grid(row=20, column=0, sticky='nw')
-# labels for subtitle
-label=tk.Label(page2, text='Input file')
-label.grid(row=22, column=0)
-label=tk.Label(page2, text='Output directory')
-label.grid(row=23, column=0)
-label=tk.Label(page2, text='Output file')
-label.grid(row=24, column=1, sticky='e')
-
-# entries for path
-input_path_tmp=tk.StringVar()
-output_dir_tmp=tk.StringVar()
-output_name_tmp=tk.StringVar()
-edTxt4=tk.Entry(page2, textvariable=input_path_tmp, width=45, borderwidth=2)
-edTxt4.grid(row=22, column=1, columnspan=4)
-edTxt5=tk.Entry(page2, textvariable=output_dir_tmp, width=45, borderwidth=2)
-edTxt5.grid(row=23, column=1, columnspan=4)
-edTxt6=tk.Entry(page2, textvariable=output_name_tmp,
-                  justify='right', width=29, borderwidth=2)
-edTxt6.grid(row=24, column=2, columnspan=2)
-
-# bottons for browsing file/directory
-
-
-def browse_file():
-    dir=fdialog.askopenfilename(
-        initialdir=os.getcwd(),
-        title="Select a file")
-    repeatedly_click(edTxt4,dir)
-
-
-def browse_dir():
-    dir=fdialog.askdirectory(
-        initialdir=os.getcwd(),
-        title="Select a directory")
-    repeatedly_click(edTxt5,dir)
-
-# Revised by Chong-You Wang, 2021-06-16.
-def repeatedly_click(Ety,new):
-    Ety.delete(0,END)
-    Ety.insert(0,new)
-
-
-
-btn1=tk.Button(page2, text=Import_file_btn,    # change browse file and dir.
-                 command=lambda *args: browse_file())
-btn2=tk.Button(page2, text=Output_dir_btn,
-                 command=lambda *args: browse_dir())
-btn1.grid(row=22, column=6)
-btn2.grid(row=23, column=6)
-
-# button for Single point Transform
-btn=tk.Button(page2, text=Single_trans_btn, command=lambda *args: Execute(0))
-btn.grid(row=14, column=2)
-
-# button for File import Transform
-btn=tk.Button(page2, text=File_trans_btn, command=lambda *args: Execute(1))
-btn.grid(row=24, column=6)
-
-
-# close button
-def Done():
-    # close the GUI interface
-    main.quit()
-
-
-btn=tk.Button(page2, text=Close_btn, bg='#c0c0c0',
-                command=lambda *args: Done())
-btn.grid(row=25, column=7)
-
-# <<<<< note text >>>>>
-note1="註1 : 水深值(垂直基準面至海床垂直距離)坐標軸向下為正"
-note2="註2 : 海床橢球高(橢球面至海床垂直距離)坐標軸向上為正"
-note3="註3 : Ellipsoid在海域上指的是海床橢球高，在陸域則是代表該點的橢球高"	### note3="註3 : EL 代表海床橢球高"
-note4="註4 : 內陸橢球高進行正高轉換時，輸出值為負代表該點在geoid之上，"	### 新增
-note5="         例如: 輸出值為-5公尺代表該點正高為5公尺"	### 新增
-
-label=tk.Label(page2, text=note1)
-label.grid(row=26, column=0, columnspan=5, rowspan=1, sticky='nw')
-
-label=tk.Label(page2, text=note2)
-label.grid(row=27, column=0, columnspan=5, rowspan=1, sticky='nw')
-
-label=tk.Label(page2, text=note3)
-label.grid(row=28, column=0, columnspan=5, rowspan=1, sticky='nw')
-
-label=tk.Label(page2, text=note4)	### 新增
-label.grid(row=29, column=0, columnspan=5, rowspan=1, sticky='nw')	### 新增
-
-label=tk.Label(page2, text=note5)	### 新增
-label.grid(row=30, column=0, columnspan=5, rowspan=1, sticky='nw')	### 新增
-
-main.mainloop()
+if __name__ == "__main__":
+    main()
