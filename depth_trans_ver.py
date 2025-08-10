@@ -1,6 +1,7 @@
 # -*- coding: big5 -*-
 """
 Vertical Datum Transformation - PyQt5 version (accelerated)
+Version : 3.0.0
 Requirements:
   - Python 3.9+
   - numpy, scipy, pillow, PyQt5
@@ -480,3 +481,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
