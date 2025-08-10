@@ -13,15 +13,15 @@ Folder layout:
 
 import os
 import sys
+import io
 import numpy as np
-
 from functools import lru_cache
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton, QFileDialog,
-    QGridLayout, QTabWidget, QRadioButton, QButtonGroup, QComboBox, QMessageBox
+    QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
+    QFileDialog, QGridLayout, QComboBox, QMessageBox
 )
 
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
@@ -31,7 +31,7 @@ from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 # Config & constants
 # -----------------------------
 GUI_TITLE = "Vertical Datum Transformation (PyQt5)"
-GUI_SIZE = (760, 640)
+GUI_SIZE = (840, 760)
 
 Surface = [
     "Mean Sea Surface (MSS)",
@@ -45,6 +45,7 @@ Surface = [
 ]
 Surface_nickname = ["MSS", "HAT", "MHW", "MLW", "LAT", "ISLW", "Geoid", "EL"]
 
+# 外部檔案路徑（請放在專案根目錄的 file/ 資料夾）
 Surface_file = [
     "file/MSS.xyz",
     "file/HAT.xyz",
@@ -54,7 +55,6 @@ Surface_file = [
     "file/ISLW.xyz",
     "file/geoid.xyz"
 ]
-
 FIG_PATH = "file/fig1.png"
 
 # 有效範圍（台灣近海）：118–125E, 21–27N
@@ -65,9 +65,9 @@ LAT_MIN, LAT_MAX = 21.0, 27.0
 # -----------------------------
 # IO helpers
 # -----------------------------
-def read_llv(filename: str):
+def read_llv_from_file(filename: str):
     lon, lat, val = [], [], []
-    with open(filename, "r", encoding="utf-8") as f:
+    with open(filename, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             s = line.strip().split()
             if len(s) < 3:
@@ -79,19 +79,14 @@ def read_llv(filename: str):
                 continue
     return np.asarray(lon), np.asarray(lat), np.asarray(val)
 
-
 def write_llvn(filename: str, lon, lat, value1, value2):
     with open(filename, "w", encoding="utf-8") as g:
         for i in range(len(lon)):
-            lo = float(lon[i])
-            la = float(lat[i])
-            v1 = value1[i]
-            v2 = value2[i]
-            # 對於 NaN，輸出空白
+            lo = float(lon[i]); la = float(lat[i])
+            v1 = value1[i]; v2 = value2[i]
             s_v1 = f"{v1:8.3f}" if np.isfinite(v1) else "      NaN"
             s_v2 = f"{v2:8.3f}" if np.isfinite(v2) else "      NaN"
             g.write(f"{lo:11.7f} {la:10.7f} {s_v1} {s_v2}\n")
-
 
 def check_range(lon, lat, value):
     lon = np.asarray(lon); lat = np.asarray(lat); value = np.asarray(value)
@@ -106,22 +101,19 @@ def check_range(lon, lat, value):
 # -----------------------------
 @lru_cache(maxsize=None)
 def load_surface_points(surface_idx: int):
-    """Load raw xyz once and cache."""
-    # Ellipsoid: return empty arrays; handled as zeros later
+    """讀取點雲並快取。"""
     if surface_idx == 7:
         return np.empty((0, 2)), np.empty((0,))
     path = Surface_file[surface_idx]
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing surface file: {path}")
-    lon, lat, val = read_llv(path)
+    lon, lat, val = read_llv_from_file(path)
     P = np.column_stack([lon, lat]).astype(np.float64)
     V = val.astype(np.float64)
     return P, V
 
-
 _interpolators_linear = {}
 _interpolators_nearest = {}
-
 
 def get_linear_interp(surface_idx: int):
     if surface_idx == 7:
@@ -131,7 +123,6 @@ def get_linear_interp(surface_idx: int):
         _interpolators_linear[surface_idx] = LinearNDInterpolator(P, V)
     return _interpolators_linear[surface_idx]
 
-
 def get_nearest_interp(surface_idx: int):
     if surface_idx == 7:
         return None
@@ -140,28 +131,18 @@ def get_nearest_interp(surface_idx: int):
         _interpolators_nearest[surface_idx] = NearestNDInterpolator(P, V)
     return _interpolators_nearest[surface_idx]
 
-
 def interp_surface_with_fallback(surface_idx: int, XY: np.ndarray) -> np.ndarray:
-    """
-    回傳該 surface 相對橢球的高程 H_surface(λ,φ)（向上為正）
-    Ellipsoid(7) 視為 0。
-    策略：linear 為主，NaN 再用 nearest 回補。
-    """
+    """線性插值，NaN 以最近鄰回補。Ellipsoid 回 0。"""
     if surface_idx == 7:
         return np.zeros(XY.shape[0], dtype=np.float64)
-
     lin = get_linear_interp(surface_idx)
     z = lin(XY[:, 0], XY[:, 1])
-
     if np.isscalar(z):
-        # 單點輸入情形，包成 array
         z = np.asarray([z], dtype=np.float64)
-
     if np.isnan(z).any():
         nn = get_nearest_interp(surface_idx)
         z_nn = nn(XY[:, 0], XY[:, 1])
         z = np.where(np.isnan(z), z_nn, z)
-
     return z.astype(np.float64)
 
 
@@ -175,33 +156,31 @@ def transform_values(input_surface_idx: int,
                      values: np.ndarray,
                      input_value_type: str):
     """
-    input_value_type: 'DEPTH' (向下為正) or 'ELLI_BED' (海床橢球高，向上為正)
-    回傳：
-      new_vals, H_in, H_out  （皆為 numpy array）
-    假設：所有 Surface_file 之 value 為「對橢球高程」。
+    input_value_type:
+        'DEPTH'    深度（向下為正）
+        'ELLI_BED' 海床橢球高（向上為正）
+    假設：所有 surface 的值皆為對橢球高程 H_surface(λ,φ)（向上為正）
     """
     XY = np.column_stack([lon.astype(np.float64), lat.astype(np.float64)])
-    H_in = interp_surface_with_fallback(input_surface_idx, XY)
+    H_in  = interp_surface_with_fallback(input_surface_idx,  XY)
     H_out = interp_surface_with_fallback(output_surface_idx, XY)
 
     if input_value_type == "DEPTH":
-        # 已知深度（向下為正）。純位移換算。
+        # 純位移：d_out = d_in + (H_out - H_in)
         new_vals = values + (H_out - H_in)
     elif input_value_type == "ELLI_BED":
-        # 已知海床橢球高（向上為正），輸出想要「相對 output_surface 的深度」
         # d_out = H_out - h_bed
         new_vals = H_out - values
     else:
         raise ValueError("Unknown input_value_type")
-
     return new_vals, H_in, H_out
 
 
 # -----------------------------
-# Worker thread for file transform
+# Worker for file transform
 # -----------------------------
 class FileTransformWorker(QThread):
-    finished = pyqtSignal(bool, str)  # success, message
+    finished = pyqtSignal(bool, str)
 
     def __init__(self, input_surface_idx, output_surface_idx,
                  input_path, output_dir, output_name, input_value_type):
@@ -215,26 +194,34 @@ class FileTransformWorker(QThread):
 
     def run(self):
         try:
-            lon0, lat0, val0 = read_llv(self.input_path)
+            lon0, lat0, val0 = [], [], []
+            with open(self.input_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip().split()
+                    if len(s) < 3: continue
+                    try:
+                        lo = float(s[0]); la = float(s[1]); v = float(s[2])
+                        lon0.append(lo); lat0.append(la); val0.append(v)
+                    except ValueError:
+                        continue
+            lon0 = np.asarray(lon0); lat0 = np.asarray(lat0); val0 = np.asarray(val0)
             if lon0.size == 0:
                 self.finished.emit(False, "Input file is empty or invalid.")
                 return
 
             lon_in, lat_in, val_in, idx_out = check_range(lon0, lat0, val0)
-
             if lon_in.size > 0:
                 new_in, _, _ = transform_values(
                     self.input_surface_idx, self.output_surface_idx,
                     lon_in, lat_in, val_in, self.input_value_type
                 )
-                # 回填成與原始同長度
+                # 遮罩回填到原長度
                 new_full = np.full(lon0.shape[0], np.nan, dtype=np.float64)
                 mask = np.ones(lon0.shape[0], dtype=bool)
                 if idx_out.size > 0:
                     mask[idx_out] = False
                 new_full[mask] = new_in
             else:
-                # 全部越界
                 new_full = np.full(lon0.shape[0], np.nan, dtype=np.float64)
 
             os.makedirs(self.output_dir, exist_ok=True)
@@ -252,7 +239,7 @@ class FileTransformWorker(QThread):
 
 
 # -----------------------------
-# Main window (PyQt5)
+# Main window (Single Page)
 # -----------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -260,183 +247,153 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(GUI_TITLE)
         self.resize(*GUI_SIZE)
 
-        # State
+        # Default selection
         self.input_surface_idx = 0
         self.output_surface_idx = 1
 
-        # Widgets
-        tabs = QTabWidget()
-        self.setCentralWidget(tabs)
+        # Central widget
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QGridLayout(root)
 
-        # Tab 1: Information
-        self.tab_info = QWidget()
-        self.build_tab_info(self.tab_info)
-        tabs.addTab(self.tab_info, "Information")
+        # A) 下拉選單（在 Single point 之上）
+        lbl_sel_title = QLabel("Surfaces")
+        lbl_sel_title.setStyleSheet("font-weight:600;")
+        layout.addWidget(lbl_sel_title, 0, 0, Qt.AlignLeft)
 
-        # Tab 2: Transformation
-        self.tab_trans = QWidget()
-        self.build_tab_trans(self.tab_trans)
-        tabs.addTab(self.tab_trans, "Transformation")
+        layout.addWidget(QLabel("Input Surface"), 1, 0, Qt.AlignLeft)
+        self.cmb_in_surface = QComboBox()
+        self.cmb_in_surface.addItems(Surface)
+        self.cmb_in_surface.setCurrentIndex(self.input_surface_idx)
+        self.cmb_in_surface.currentIndexChanged.connect(self.on_in_surface_changed)
+        layout.addWidget(self.cmb_in_surface, 1, 1, 1, 2)
 
-    # ---- Tab 1 ----
-    def build_tab_info(self, parent: QWidget):
-        layout = QGridLayout(parent)
+        layout.addWidget(QLabel("Output Surface"), 1, 3, Qt.AlignLeft)
+        self.cmb_out_surface = QComboBox()
+        self.cmb_out_surface.addItems(Surface)
+        self.cmb_out_surface.setCurrentIndex(self.output_surface_idx)
+        self.cmb_out_surface.currentIndexChanged.connect(self.on_out_surface_changed)
+        layout.addWidget(self.cmb_out_surface, 1, 4, 1, 2)
 
-        # 左右兩欄：輸入基準 / 輸出基準
-        lbl_in = QLabel("Input Surface")
-        lbl_in.setStyleSheet("font-weight:600;")
-        layout.addWidget(lbl_in, 0, 0, Qt.AlignLeft)
-
-        lbl_out = QLabel("Output Surface")
-        lbl_out.setStyleSheet("font-weight:600;")
-        layout.addWidget(lbl_out, 0, 2, Qt.AlignLeft)
-
-        # Radio groups
-        self.grp_in = QButtonGroup(self)
-        self.grp_out = QButtonGroup(self)
-
-        for i, name in enumerate(Surface):
-            rb_in = QRadioButton(name)
-            rb_out = QRadioButton(name)
-            if i == 0:
-                rb_in.setChecked(True)
-            if i == 1:
-                rb_out.setChecked(True)
-            self.grp_in.addButton(rb_in, i)
-            self.grp_out.addButton(rb_out, i)
-            layout.addWidget(rb_in, i + 1, 0, Qt.AlignLeft)
-            layout.addWidget(rb_out, i + 1, 2, Qt.AlignLeft)
-
-        self.grp_in.buttonClicked[int].connect(self.on_input_surface_changed)
-        self.grp_out.buttonClicked[int].connect(self.on_output_surface_changed)
-
-        # Image
-        fig_label = QLabel()
-        if os.path.exists(FIG_PATH):
-            pix = QPixmap(FIG_PATH)
-            if not pix.isNull():
-                # 等比例縮放寬 520
-                w = 520
-                h = int(pix.height() * (w / pix.width()))
-                fig_label.setPixmap(pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        layout.addWidget(fig_label, 20, 0, 1, 3, Qt.AlignLeft)
-
-    def on_input_surface_changed(self, idx: int):
-        self.input_surface_idx = idx
-        # 不允許同一面：若相同就把 output 往下一格
-        if self.input_surface_idx == self.output_surface_idx:
-            new_out = (self.output_surface_idx + 1) % len(Surface)
-            self.grp_out.button(new_out).setChecked(True)
-            self.output_surface_idx = new_out
-
-    def on_output_surface_changed(self, idx: int):
-        self.output_surface_idx = idx
-        if self.input_surface_idx == self.output_surface_idx:
-            new_in = (self.input_surface_idx + 1) % len(Surface)
-            self.grp_in.button(new_in).setChecked(True)
-            self.input_surface_idx = new_in
-
-    # ---- Tab 2 ----
-    def build_tab_trans(self, parent: QWidget):
-        layout = QGridLayout(parent)
-
-        # Range box (文字)
+        # B) Range 區塊（小圖示意）
         lbl_range_title = QLabel("Range")
         lbl_range_title.setStyleSheet("font-weight:600;")
-        layout.addWidget(lbl_range_title, 0, 0, Qt.AlignLeft)
+        layout.addWidget(lbl_range_title, 3, 0, Qt.AlignLeft)
 
         lbl_range = QLabel(
             "     ---------  27 N ---------\n"
-            "    |                           |\n"
-            "    118 E                    125 E\n"
-            "    |                           |\n"
+            "    |                                 |\n"
+            "    118 E                           125 E\n"
+            "    |                                 |\n"
             "     ---------  21 N ---------\n"
         )
-        layout.addWidget(lbl_range, 1, 0, 1, 4, Qt.AlignLeft)
+        layout.addWidget(lbl_range, 4, 0, 1, 3, Qt.AlignLeft)
 
-        # ---- Single point ----
+        # C) Single point
         lbl_single = QLabel("Single point")
         lbl_single.setStyleSheet("font-weight:600;")
-        layout.addWidget(lbl_single, 3, 0, Qt.AlignLeft)
+        layout.addWidget(lbl_single, 6, 0, Qt.AlignLeft)
 
-        layout.addWidget(QLabel("Longitude"), 4, 0)
-        layout.addWidget(QLabel("Latitude"), 4, 1)
-        layout.addWidget(QLabel("Input value"), 4, 2)
+        layout.addWidget(QLabel("Longitude"), 7, 0)
+        layout.addWidget(QLabel("Latitude"), 7, 1)
+        layout.addWidget(QLabel("Input value"), 7, 2)
 
         self.ed_lon = QLineEdit(); self.ed_lon.setPlaceholderText("e.g. 121.5")
         self.ed_lat = QLineEdit(); self.ed_lat.setPlaceholderText("e.g. 24.0")
         self.ed_val = QLineEdit(); self.ed_val.setPlaceholderText("float")
 
-        layout.addWidget(self.ed_lon, 5, 0)
-        layout.addWidget(self.ed_lat, 5, 1)
-        layout.addWidget(self.ed_val, 5, 2)
+        layout.addWidget(self.ed_lon, 8, 0)
+        layout.addWidget(self.ed_lat, 8, 1)
+        layout.addWidget(self.ed_val, 8, 2)
 
-        # Input value type
-        layout.addWidget(QLabel("Input value type"), 4, 3)
+        layout.addWidget(QLabel("Input value type"), 7, 3)
         self.cmb_valtype = QComboBox()
         self.cmb_valtype.addItems(["Depth (down +)", "Ellipsoidal bed height (up +)"])
-        layout.addWidget(self.cmb_valtype, 5, 3)
+        layout.addWidget(self.cmb_valtype, 8, 3)
 
-        # Output labels
         self.lbl_single_out_title = QLabel("New value")
-        layout.addWidget(self.lbl_single_out_title, 6, 2)
+        layout.addWidget(self.lbl_single_out_title, 9, 2)
         self.lbl_single_in_nick = QLabel("(      )")
         self.lbl_single_out_nick = QLabel("(      )")
-        layout.addWidget(self.lbl_single_in_nick, 5, 4)
-        layout.addWidget(self.lbl_single_out_nick, 7, 4)
+        layout.addWidget(self.lbl_single_in_nick, 8, 5)
+        layout.addWidget(self.lbl_single_out_nick, 10, 5)
+        self.update_nick_labels()
 
         self.lbl_single_out_val = QLabel("—")
-        layout.addWidget(self.lbl_single_out_val, 7, 2)
+        layout.addWidget(self.lbl_single_out_val, 10, 2)
 
         btn_single = QPushButton("Transform >")
         btn_single.clicked.connect(self.do_single_transform)
-        layout.addWidget(btn_single, 6, 3)
+        layout.addWidget(btn_single, 9, 3)
 
-        # ---- File transform ----
+        # D) File transform
         lbl_file = QLabel("Import a file")
         lbl_file.setStyleSheet("font-weight:600;")
-        layout.addWidget(lbl_file, 10, 0, Qt.AlignLeft)
+        layout.addWidget(lbl_file, 12, 0, Qt.AlignLeft)
 
-        layout.addWidget(QLabel("Input file"), 12, 0)
-        layout.addWidget(QLabel("Output directory"), 13, 0)
-        layout.addWidget(QLabel("Output file"), 14, 1, Qt.AlignRight)
+        layout.addWidget(QLabel("Input file"), 14, 0)
+        layout.addWidget(QLabel("Output directory"), 15, 0)
+        layout.addWidget(QLabel("Output file"), 16, 1, Qt.AlignRight)
 
         self.ed_infile = QLineEdit()
         self.ed_outdir = QLineEdit()
-        self.ed_outname = QLineEdit()
-        self.ed_outname.setPlaceholderText("output.xyz")
-
-        layout.addWidget(self.ed_infile, 12, 1, 1, 3)
-        layout.addWidget(self.ed_outdir, 13, 1, 1, 3)
-        layout.addWidget(self.ed_outname, 14, 2, 1, 2)
+        self.ed_outname = QLineEdit(); self.ed_outname.setPlaceholderText("output.xyz")
+        layout.addWidget(self.ed_infile, 14, 1, 1, 3)
+        layout.addWidget(self.ed_outdir, 15, 1, 1, 3)
+        layout.addWidget(self.ed_outname, 16, 2, 1, 2)
 
         btn_browse_in = QPushButton("Browse")
         btn_browse_out = QPushButton("Browse")
         btn_browse_in.clicked.connect(self.pick_infile)
         btn_browse_out.clicked.connect(self.pick_outdir)
-        layout.addWidget(btn_browse_in, 12, 4)
-        layout.addWidget(btn_browse_out, 13, 4)
+        layout.addWidget(btn_browse_in, 14, 4)
+        layout.addWidget(btn_browse_out, 15, 4)
 
         self.btn_file_transform = QPushButton("Transform")
         self.btn_file_transform.clicked.connect(self.do_file_transform)
-        layout.addWidget(self.btn_file_transform, 14, 4)
+        layout.addWidget(self.btn_file_transform, 16, 4)
 
         self.lbl_file_status = QLabel("")
-        layout.addWidget(self.lbl_file_status, 15, 4)
+        layout.addWidget(self.lbl_file_status, 17, 4)
 
-        # Notes
+        # E) fig1.png（最底部，但在 Notes 上方）
+        self.fig_label = QLabel()
+        pix = QPixmap(FIG_PATH) if os.path.exists(FIG_PATH) else QPixmap()
+        if not pix.isNull():
+            w = 640
+            h = int(pix.height() * (w / pix.width()))
+            self.fig_label.setPixmap(pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(self.fig_label, 19, 0, 1, 6, Qt.AlignLeft)
+
+        # F) Notes（頁面最後）
         note1 = "註1 : 水深值(垂直基準面至海床垂直距離)坐標軸向下為正"
         note2 = "註2 : 海床橢球高(橢球面至海床垂直距離)坐標軸向上為正"
         note3 = "註3 : Ellipsoid在海域上指的是海床橢球高，在陸域則是代表該點的橢球高"
         note4 = "註4 : 內陸橢球高進行正高轉換時，輸出值為負代表該點在geoid之上，"
         note5 = "         例如: 輸出值為-5公尺代表該點正高為5公尺"
+        note6 = "Created by Mingyi Hsu"
+        layout.addWidget(QLabel(note1), 21, 0, 1, 6)
+        layout.addWidget(QLabel(note2), 22, 0, 1, 6)
+        layout.addWidget(QLabel(note3), 23, 0, 1, 6)
+        layout.addWidget(QLabel(note4), 24, 0, 1, 6)
+        layout.addWidget(QLabel(note5), 25, 0, 1, 6)
+        layout.addWidget(QLabel(note6), 26, 0, 1, 6)
 
-        layout.addWidget(QLabel(note1), 20, 0, 1, 5)
-        layout.addWidget(QLabel(note2), 21, 0, 1, 5)
-        layout.addWidget(QLabel(note3), 22, 0, 1, 5)
-        layout.addWidget(QLabel(note4), 23, 0, 1, 5)
-        layout.addWidget(QLabel(note5), 24, 0, 1, 5)
+    # --- Surface dropdown events ---
+    def on_in_surface_changed(self, idx: int):
+        self.input_surface_idx = idx
+        if self.input_surface_idx == self.output_surface_idx:
+            new_out = (self.output_surface_idx + 1) % len(Surface)
+            self.cmb_out_surface.setCurrentIndex(new_out)
+            self.output_surface_idx = new_out
+        self.update_nick_labels()
 
+    def on_out_surface_changed(self, idx: int):
+        self.output_surface_idx = idx
+        if self.input_surface_idx == self.output_surface_idx:
+            new_in = (self.input_surface_idx + 1) % len(Surface)
+            self.cmb_in_surface.setCurrentIndex(new_in)
+            self.input_surface_idx = new_in
         self.update_nick_labels()
 
     def update_nick_labels(self):
@@ -445,7 +402,6 @@ class MainWindow(QMainWindow):
 
     # --- Single transform ---
     def do_single_transform(self):
-        # inputs check
         lon_txt = self.ed_lon.text().strip()
         lat_txt = self.ed_lat.text().strip()
         val_txt = self.ed_val.text().strip()
@@ -457,7 +413,6 @@ class MainWindow(QMainWindow):
         except ValueError:
             QMessageBox.information(self, "Error", "Please type in float format.")
             return
-
         if not (LON_MIN <= lon <= LON_MAX and LAT_MIN <= lat <= LAT_MAX):
             QMessageBox.information(
                 self, "Error",
@@ -466,8 +421,6 @@ class MainWindow(QMainWindow):
             return
 
         input_type = "DEPTH" if self.cmb_valtype.currentIndex() == 0 else "ELLI_BED"
-
-        # compute
         new_vals, _, _ = transform_values(
             self.input_surface_idx, self.output_surface_idx,
             np.array([lon]), np.array([lat]), np.array([val]), input_type
@@ -490,19 +443,14 @@ class MainWindow(QMainWindow):
         in_path = self.ed_infile.text().strip()
         out_dir = self.ed_outdir.text().strip()
         out_name = self.ed_outname.text().strip()
-
         if not in_path:
-            QMessageBox.information(self, "Error", "Please select the input file")
-            return
+            QMessageBox.information(self, "Error", "Please select the input file"); return
         if not out_dir:
-            QMessageBox.information(self, "Error", "Please choose a directory for output file")
-            return
+            QMessageBox.information(self, "Error", "Please choose a directory for output file"); return
         if not out_name:
-            QMessageBox.information(self, "Error", "Please name the output file")
-            return
+            QMessageBox.information(self, "Error", "Please name the output file"); return
 
         input_type = "DEPTH" if self.cmb_valtype.currentIndex() == 0 else "ELLI_BED"
-
         self.btn_file_transform.setEnabled(False)
         self.lbl_file_status.setText("Running...")
 
